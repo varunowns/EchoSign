@@ -47,6 +47,8 @@ logs/
 
 # Data (large files)
 data/raw/*.npy
+data/raw/*.json
+data/processed/*.pkl
 models/*.pkl
 models/*.pt
 models/*.pth
