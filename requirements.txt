@@ -1,0 +1,4 @@
+# Root-level convenience requirements
+# Points to the canonical backend requirements.
+# Install with: pip install -r requirements.txt
+-r backend/requirements.txt

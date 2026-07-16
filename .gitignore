@@ -22,9 +22,12 @@ wheels/
 
 # Virtual environments
 venv/
+venv_310/
+venv311/
 env/
 ENV/
 .venv
+backend/echosign_py310/
 
 # IDE
 .vscode/
@@ -49,9 +52,15 @@ logs/
 data/raw/*.npy
 data/raw/*.json
 data/processed/*.pkl
+backend/data/raw/*.npy
+backend/data/raw/*.json
+backend/data/processed/*.pkl
 models/*.pkl
 models/*.pt
 models/*.pth
+backend/models/*.pkl
+backend/models/*.pt
+backend/models/*.pth
 
 # Environment
 .env
@@ -65,3 +74,4 @@ models/*.pth
 # Next.js build
 frontend/.next/
 frontend/out/
+frontend/node_modules/
