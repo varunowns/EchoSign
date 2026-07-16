@@ -150,7 +150,7 @@ class StaticGestureClassifier:
                 'classes': self.classes,
                 'is_trained': self.is_trained,
             }, f)
-        print(f"✓ Model saved to {path}")
+        print(f"[OK] Model saved to {path}")
 
     @classmethod
     def load(cls, path: str):
@@ -162,7 +162,7 @@ class StaticGestureClassifier:
         obj.model = data['model']
         obj.classes = data['classes']
         obj.is_trained = data['is_trained']
-        print(f"✓ Model loaded from {path}")
+        print(f"[OK] Model loaded from {path}")
         return obj
 
 

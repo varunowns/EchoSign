@@ -8,14 +8,29 @@ import NeuralEngine from '@/components/echosign/NeuralEngine';
 import TranscriptDock from '@/components/echosign/TranscriptDock';
 import { useBackendInference } from '@/hooks/useBackendInference';
 
-const GESTURES = ['HELLO', 'PLEASE', 'THANK YOU', 'YES', 'HELP'] as const;
+const CAPTURE_INTERVAL_MS = 33; // 30 FPS to match backend capability
 
 const GESTURE_SENTENCES: Record<string, string> = {
-  HELLO: 'Hello, how are you doing today?',
-  PLEASE: 'Please help me with this.',
-  'THANK YOU': 'Thank you so much for your assistance.',
-  YES: 'Yes, I understand you.',
-  HELP: 'I need some help right now.',
+  A: 'The letter A',
+  B: 'The letter B',
+  C: 'The letter C',
+  D: 'The letter D',
+  E: 'The letter E',
+  F: 'The letter F',
+  G: 'The letter G',
+  H: 'The letter H',
+  I: 'The letter I',
+  J: 'The letter J',
+  K: 'The letter K',
+  L: 'The letter L',
+  M: 'The letter M',
+  N: 'The letter N',
+  O: 'The letter O',
+  P: 'The letter P',
+  Q: 'The letter Q',
+  R: 'The letter R',
+  S: 'The letter S',
+  T: 'The letter T',
 };
 
 interface TranscriptEntry {
@@ -36,23 +51,39 @@ function getTimestamp(): string {
 
 export default function EchoSignDashboard() {
   const [isLiveMode, setIsLiveMode] = useState(false);
-  const [currentGestureIdx, setCurrentGestureIdx] = useState(0);
-  const [gesture, setGesture] = useState<string>('THANK YOU');
-  const [confidence, setConfidence] = useState(96.4);
+  const [gesture, setGesture] = useState<string>('WAITING');
+  const [confidence, setConfidence] = useState(0);
   const [debounceProgress, setDebounceProgress] = useState(0);
   const [isPulsing, setIsPulsing] = useState(false);
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const [isVoiceActive, setIsVoiceActive] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
-  const [fps, setFps] = useState(30.0);
-  const [latency, setLatency] = useState(142);
-  const [useDemo, setUseDemo] = useState(true);
+  const [fps, setFps] = useState(0);
+  const [latency, setLatency] = useState(0);
+  const [cameraReady, setCameraReady] = useState(false);
+  const [cameraError, setCameraError] = useState<string | null>(null);
+  const [cameraStatus, setCameraStatus] = useState('Camera idle');
 
-  const { status, predictions, connect, disconnect } = useBackendInference();
+  const { status, lastMessage, connect, disconnect, sendFrame, checkHealth } = useBackendInference();
 
   const entryIdRef = useRef(0);
   const debounceAnimRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const gestureIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const debounceResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const captureCanvasRef = useRef<HTMLCanvasElement>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const captureIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const clearGestureAnimation = useCallback(() => {
+    if (debounceAnimRef.current) {
+      clearInterval(debounceAnimRef.current);
+      debounceAnimRef.current = null;
+    }
+    if (debounceResetRef.current) {
+      clearTimeout(debounceResetRef.current);
+      debounceResetRef.current = null;
+    }
+  }, []);
 
   const triggerGestureTransition = useCallback(
     (newGesture: string, newConfidence: number) => {
@@ -61,10 +92,8 @@ export default function EchoSignDashboard() {
       setIsPulsing(true);
       setDebounceProgress(0);
 
-      // Clear any existing debounce animation
-      if (debounceAnimRef.current) clearInterval(debounceAnimRef.current);
+      clearGestureAnimation();
 
-      // Animate debounce ring over 300ms
       const startTime = Date.now();
       const duration = 300;
       debounceAnimRef.current = setInterval(() => {
@@ -72,8 +101,7 @@ export default function EchoSignDashboard() {
         const progress = Math.min(elapsed / duration, 1);
         setDebounceProgress(progress);
         if (progress >= 1) {
-          if (debounceAnimRef.current) clearInterval(debounceAnimRef.current);
-          // Commit to transcript
+          clearGestureAnimation();
           const entry: TranscriptEntry = {
             id: ++entryIdRef.current,
             text: GESTURE_SENTENCES[newGesture] || newGesture,
@@ -82,89 +110,191 @@ export default function EchoSignDashboard() {
           };
           setTranscript((prev) => [...prev, entry]);
 
-          // Trigger TTS simulation
           if (isVoiceActive) {
             setIsSpeaking(true);
             setTimeout(() => setIsSpeaking(false), 2000);
           }
 
-          setTimeout(() => {
+          debounceResetRef.current = setTimeout(() => {
             setIsPulsing(false);
             setDebounceProgress(0);
           }, 400);
         }
       }, 16);
     },
-    [isVoiceActive]
+    [clearGestureAnimation, isVoiceActive]
   );
 
-  // Handle live mode toggle with backend connection
-  const handleToggleLiveMode = useCallback(() => {
-    setIsLiveMode((prev) => {
-      const enable = !prev;
-      if (enable && status.healthy && !useDemo) {
-        connect();
-      } else {
-        setUseDemo(true);
-        disconnect();
-      }
-      return enable;
-    });
-  }, [status.healthy, useDemo, connect, disconnect]);
-
-  // Listen for real backend predictions
-  useEffect(() => {
-    if (!isLiveMode || useDemo || !predictions) return;
-
-    if (predictions.type === 'prediction' && predictions.data.gesture && predictions.data.confidence) {
-      triggerGestureTransition(predictions.data.gesture, predictions.data.confidence);
-      if (predictions.data.latency) setLatency(predictions.data.latency);
-      if (predictions.data.fps) setFps(predictions.data.fps);
+  const stopCaptureLoop = useCallback(() => {
+    if (captureIntervalRef.current) {
+      clearInterval(captureIntervalRef.current);
+      captureIntervalRef.current = null;
     }
-  }, [predictions, isLiveMode, useDemo, triggerGestureTransition]);
+  }, []);
 
-  // Live test mode: cycle gestures every 3 seconds
-  useEffect(() => {
-    if (!isLiveMode) {
-      if (gestureIntervalRef.current) clearInterval(gestureIntervalRef.current);
+  const stopCamera = useCallback(() => {
+    stopCaptureLoop();
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach((track) => track.stop());
+      mediaStreamRef.current = null;
+    }
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
+    setCameraReady(false);
+    setCameraStatus('Camera idle');
+  }, [stopCaptureLoop]);
+
+  const startCamera = useCallback(async () => {
+    if (mediaStreamRef.current) {
+      setCameraReady(true);
+      return true;
+    }
+
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setCameraError('Your browser does not support webcam access.');
+      return false;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: {
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          facingMode: 'user',
+        },
+      });
+
+      mediaStreamRef.current = stream;
+      const video = videoRef.current;
+      if (video) {
+        video.srcObject = stream;
+        video.muted = true;
+        await video.play().catch(() => undefined);
+      }
+      setCameraError(null);
+      setCameraReady(true);
+      setCameraStatus('Webcam connected');
+      return true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unable to access webcam.';
+      setCameraError(message);
+      setCameraStatus('Camera blocked');
+      return false;
+    }
+  }, []);
+
+  const handleToggleLiveMode = useCallback(async () => {
+    if (isLiveMode) {
+      setIsLiveMode(false);
+      disconnect();
+      stopCamera();
+      clearGestureAnimation();
       setIsPulsing(false);
+      setDebounceProgress(0);
+      setGesture('WAITING');
+      setConfidence(0);
+      setFps(0);
+      setLatency(0);
       return;
     }
 
-    // Immediately trigger first gesture
-    const nextIdx = (currentGestureIdx + 1) % GESTURES.length;
-    setCurrentGestureIdx(nextIdx);
-    const nextGesture = GESTURES[nextIdx];
-    const nextConfidence = 85 + Math.random() * 14;
-    triggerGestureTransition(nextGesture, nextConfidence);
+    setCameraStatus('Starting webcam');
+    const cameraStarted = await startCamera();
+    if (!cameraStarted) {
+      return;
+    }
 
-    gestureIntervalRef.current = setInterval(() => {
-      setCurrentGestureIdx((prev) => {
-        const idx = (prev + 1) % GESTURES.length;
-        const g = GESTURES[idx];
-        const c = 85 + Math.random() * 14;
-        triggerGestureTransition(g, c);
-        return idx;
-      });
-    }, 3000);
+    setCameraStatus('Checking backend');
+    const healthy = await checkHealth();
+    if (!healthy) {
+      setCameraError('Backend is not reachable at localhost:8000.');
+      stopCamera();
+      return;
+    }
 
-    return () => {
-      if (gestureIntervalRef.current) clearInterval(gestureIntervalRef.current);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isLiveMode]);
+    setCameraStatus('Connecting to live inference');
+    setCameraError(null);
+    connect();
+    setIsLiveMode(true);
+  }, [checkHealth, clearGestureAnimation, connect, disconnect, isLiveMode, startCamera, stopCamera]);
 
-  // Subtle FPS/latency variation
   useEffect(() => {
-    if (!isLiveMode) return;
-    const interval = setInterval(() => {
-      setFps(29.2 + Math.random() * 1.5);
-      setLatency(130 + Math.floor(Math.random() * 30));
-    }, 1500);
-    return () => clearInterval(interval);
-  }, [isLiveMode]);
+    if (!isLiveMode || !lastMessage) return;
 
-  // Voice speaking when new transcript entry is added
+    if (typeof lastMessage.fps === 'number') {
+      setFps(lastMessage.fps);
+    }
+    if (typeof lastMessage.latency_ms === 'number') {
+      setLatency(lastMessage.latency_ms);
+    }
+
+    if (lastMessage.error) {
+      setCameraError(lastMessage.error);
+    }
+
+    if (lastMessage.message) {
+      setCameraStatus(lastMessage.message);
+    }
+
+    if (lastMessage.prediction && typeof lastMessage.confidence === 'number') {
+      triggerGestureTransition(lastMessage.prediction, lastMessage.confidence);
+    }
+  }, [isLiveMode, lastMessage, triggerGestureTransition]);
+
+  const captureFrame = useCallback(() => {
+    if (!isLiveMode || !cameraReady || !status.connected) return;
+
+    const video = videoRef.current;
+    const canvas = captureCanvasRef.current;
+    if (!video || !canvas || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return;
+
+    const width = video.videoWidth;
+    const height = video.videoHeight;
+    if (!width || !height) return;
+
+    // Downscale to a reasonable size for WebSocket transmission
+    // Smaller frames keep PNG sizes manageable while preserving detail for MediaPipe
+    const MAX_CAPTURE_WIDTH = 480;
+    const scale = Math.min(1, MAX_CAPTURE_WIDTH / width);
+    const captureWidth = Math.round(width * scale);
+    const captureHeight = Math.round(height * scale);
+
+    canvas.width = captureWidth;
+    canvas.height = captureHeight;
+
+    const context = canvas.getContext('2d');
+    if (!context) return;
+
+    // Mirror the capture so the backend sees the same orientation as the user preview.
+    context.save();
+    context.scale(-1, 1);
+    context.drawImage(video, -captureWidth, 0, captureWidth, captureHeight);
+    context.restore();
+
+    // Use PNG for lossless quality (larger but preserves detail for MediaPipe)
+    // Downscaling to 480px wide keeps PNG sizes ~50-150KB per frame
+    const frameBase64 = canvas.toDataURL('image/png').split(',')[1];
+    const sent = sendFrame(frameBase64);
+
+    if (!sent) {
+      console.warn('[WARN] Frame not sent - WebSocket not open');
+    }
+  }, [cameraReady, isLiveMode, sendFrame, status.connected]);
+
+  useEffect(() => {
+    if (!isLiveMode || !cameraReady || !status.connected) {
+      stopCaptureLoop();
+      return;
+    }
+
+    captureIntervalRef.current = setInterval(captureFrame, CAPTURE_INTERVAL_MS);
+    return () => {
+      stopCaptureLoop();
+    };
+  }, [cameraReady, captureFrame, isLiveMode, status.connected, stopCaptureLoop]);
+
   useEffect(() => {
     if (isVoiceActive && transcript.length > 0) {
       setIsSpeaking(true);
@@ -172,6 +302,24 @@ export default function EchoSignDashboard() {
       return () => clearTimeout(t);
     }
   }, [transcript.length, isVoiceActive]);
+
+  useEffect(() => {
+    if (!isLiveMode) return;
+
+    if (status.connected) {
+      setCameraStatus('Live inference running');
+    } else if (status.error) {
+      setCameraStatus('Waiting for backend');
+    }
+  }, [isLiveMode, status.connected, status.error]);
+
+  useEffect(() => {
+    return () => {
+      disconnect();
+      stopCamera();
+      clearGestureAnimation();
+    };
+  }, [clearGestureAnimation, disconnect, stopCamera]);
 
   const handleClearTranscript = () => {
     setTranscript([]);
@@ -188,11 +336,13 @@ export default function EchoSignDashboard() {
     >
       <Header
         isLiveMode={isLiveMode}
+        isBackendConnected={status.connected}
         onToggleLiveMode={handleToggleLiveMode}
       />
 
       <main className="flex-1 p-4 md:p-6 flex flex-col gap-4">
-        {/* Live mode banner */}
+        <canvas ref={captureCanvasRef} className="hidden" />
+
         {isLiveMode && (
           <motion.div
             initial={{ opacity: 0, y: -8 }}
@@ -206,27 +356,34 @@ export default function EchoSignDashboard() {
               transition={{ duration: 0.8, repeat: Infinity }}
             />
             <span className="text-xs font-mono-custom text-cyan-300">
-              LIVE TEST MODE ACTIVE — Cycling ASL gestures: {GESTURES.join(' → ')}
+              LIVE TRANSLATION ACTIVE - Webcam frames are streaming to the backend in real time.
             </span>
             <span className="ml-auto font-mono-custom text-[10px] text-cyan-400/60">
-              Interval: 3.0s
+              {status.connected ? 'Socket connected' : 'Connecting...'}
             </span>
           </motion.div>
         )}
 
-        {/* Main grid */}
+        {cameraError && (
+          <div className="px-4 py-3 rounded-lg border border-red-500/30 bg-red-500/10 text-sm text-red-200">
+            {cameraError}
+          </div>
+        )}
+
         <div className="flex-1 grid grid-cols-1 lg:grid-cols-12 gap-4">
-          {/* Left: Vision & Skeleton Studio (7/12) */}
           <div className="lg:col-span-7 rounded-xl border border-cyan-500/20 bg-slate-900/40 backdrop-blur-md p-4 flex flex-col">
             <WebcamStudio
               isActive={isLiveMode}
               gesture={gesture}
               fps={fps}
               latency={latency}
+              videoRef={videoRef}
+              cameraReady={cameraReady}
+              backendConnected={status.connected}
+              cameraStatus={cameraStatus}
             />
           </div>
 
-          {/* Right: Neural Engine (5/12) */}
           <div className="lg:col-span-5 rounded-xl border border-cyan-500/20 bg-slate-900/40 backdrop-blur-md p-4 overflow-hidden">
             <NeuralEngine
               isActive={isLiveMode}
@@ -236,14 +393,13 @@ export default function EchoSignDashboard() {
               debounceProgress={debounceProgress}
               modelMetrics={{
                 accuracy: '98.7%',
-                latency: '142ms',
-                inferenceHz: 30,
+                latency: latency > 0 ? `${latency}ms` : '---',
+                inferenceHz: fps > 0 ? Math.round(fps) : 0,
               }}
             />
           </div>
         </div>
 
-        {/* Bottom dock */}
         <TranscriptDock
           transcript={transcript}
           onClear={handleClearTranscript}
@@ -259,7 +415,7 @@ export default function EchoSignDashboard() {
           EchoSign M6 — Neural ASL Translation Engine &copy; 2024
         </span>
         <div className="flex items-center gap-3">
-          {['TensorFlow.js', 'MediaPipe', 'WebGL', 'ASL2024'].map((tech) => (
+          {['FastAPI', 'MediaPipe', 'WebSocket', 'ASL2024'].map((tech) => (
             <span
               key={tech}
               className="font-mono-custom text-[9px] text-slate-600 px-1.5 py-0.5 rounded bg-slate-800/60 border border-slate-700/30"

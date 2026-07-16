@@ -16,9 +16,11 @@ from fastapi.responses import JSONResponse
 import cv2
 import numpy as np
 import torch
-import asyncio
 import base64
-from typing import Optional
+import time
+import sys
+import mediapipe as mp
+from pathlib import Path
 import logging
 
 # Import M1-M5 pipeline components
@@ -31,7 +33,7 @@ except ImportError as e:
     print("Make sure M1-M5 files are in the same directory or PYTHONPATH")
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, stream=sys.stdout, force=True)
 logger = logging.getLogger(__name__)
 
 # Initialize FastAPI app
@@ -54,6 +56,16 @@ app.add_middleware(
 inference_engine = None
 classifier_m2 = None
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+BASE_DIR = Path(__file__).resolve().parent
+
+
+def resolve_existing_path(*relative_paths: str) -> str:
+    """Resolve model paths across the repo root and backend/ directories."""
+    for rel_path in relative_paths:
+        candidate = (BASE_DIR / rel_path).resolve()
+        if candidate.exists():
+            return str(candidate)
+    return str((BASE_DIR / relative_paths[0]).resolve())
 
 
 class BackendConfig:
@@ -64,8 +76,8 @@ class BackendConfig:
         self.confidence_threshold = 0.7
         self.smoothing_window = 5
         self.debounce_frames = 3
-        self.model_path_m2 = "backend/models/asl_alphabet.pkl"
-        self.model_path_m4 = "backend/models/asl_sequence.pt"
+        self.model_path_m2 = resolve_existing_path("models/asl_alphabet.pkl", "../backend/models/asl_alphabet.pkl")
+        self.model_path_m4 = resolve_existing_path("models/asl_sequence.pt", "../backend/models/asl_sequence.pt")
 
 
 config = BackendConfig()
@@ -75,18 +87,12 @@ config = BackendConfig()
 async def startup_event():
     """Initialize models on startup."""
     global inference_engine, classifier_m2
+    classifier_m2 = None  # may stay None if M2 fails to load
 
     logger.info("Initializing EchoSign backend...")
 
     try:
-        # Initialize live inference engine (M1-M5)
-        inference_engine = LiveInferenceEngine(model_path=None)
-    logger.info("[OK] M1-M5 pipeline initialized")
-    except Exception as e:
-        logger.warning(f"Could not initialize M1-M5 pipeline: {e}")
-
-    try:
-        # Load M2 classifier if available
+        # Load M2 classifier first (engine needs it)
         classifier_m2 = StaticGestureClassifier.load(config.model_path_m2)
         config.use_m2 = True
         logger.info("[OK] M2 classifier loaded")
@@ -94,18 +100,41 @@ async def startup_event():
         logger.warning(f"M2 classifier not available: {e}")
         config.use_m2 = False
 
+    try:
+        # Initialize live inference engine (M1-M5) with M2 classifier
+        inference_engine = LiveInferenceEngine(
+            model_path=config.model_path_m4,
+            m2_classifier=classifier_m2
+        )
+        config.use_m4 = inference_engine.model is not None
+        logger.info("[OK] M1-M5 pipeline initialized")
+    except Exception as e:
+        logger.warning(f"Could not initialize M1-M5 pipeline: {e}")
+        inference_engine = None
+        config.use_m4 = False
+
     logger.info("Backend startup complete")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Release backend resources on shutdown."""
+    global inference_engine
+    if inference_engine is not None:
+        inference_engine.close()
+        inference_engine = None
 
 
 @app.get("/api/health")
 async def health_check():
     """Health check endpoint."""
     return {
-        "status": "healthy",
+        "status": "healthy" if inference_engine is not None else "degraded",
         "m1_ready": inference_engine is not None,
         "m2_ready": classifier_m2 is not None and config.use_m2,
-        "m4_ready": config.use_m4,
-        "device": str(device)
+        "m4_ready": inference_engine is not None and inference_engine.model is not None and config.use_m4,
+        "device": str(device),
+        "num_classes": inference_engine.model.fc.out_features if inference_engine and inference_engine.model is not None and hasattr(inference_engine.model, 'fc') else None
     }
 
 
@@ -197,49 +226,74 @@ async def websocket_live_inference(websocket: WebSocket):
     await websocket.accept()
     logger.info("WebSocket client connected")
 
+    # Reset engine state for new session (clear buffer, counters, post-processor)
+    if inference_engine is not None:
+        inference_engine.reset()
+
+    frame_count = 0
+
     try:
         while True:
             # Receive frame data
-            data = await websocket.receive_text()
+            try:
+                data = await websocket.receive_text()
+            except Exception as e:
+                logger.error(f"Failed to receive frame: {e}")
+                break
 
             if data == "ping":
                 await websocket.send_json({"type": "pong"})
                 continue
 
             try:
-                # Decode base64 frame
-                frame_data = base64.b64decode(data)
-                nparr = np.frombuffer(frame_data, np.uint8)
-                frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-
-                if frame is None:
-                    await websocket.send_json({"error": "Invalid frame"})
+                if inference_engine is None:
+                    logger.error("Inference engine is None!")
+                    await websocket.send_json(
+                        {"type": "error", "error": "Inference engine is not initialized."}
+                    )
                     continue
 
-                # TODO: Extract keypoints from frame (M1)
-                # TODO: Run inference (M2 or M4)
-                # TODO: Post-process (M5)
+                # Decode base64 frame
+                try:
+                    if "," in data:
+                        data = data.split(",", 1)[1]
+                    frame_data = base64.b64decode(data)
+                    nparr = np.frombuffer(frame_data, np.uint8)
+                    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-                # Placeholder response
-                response = {
-                    "type": "inference_result",
-                    "prediction": "A",
-                    "confidence": 0.92,
-                    "model": "m2",
-                    "timestamp": "2026-07-14T13:00:00Z"
-                }
+                    if frame is None:
+                        logger.warning(f"Failed to decode frame {frame_count}")
+                        await websocket.send_json({"type": "error", "error": "Invalid frame"})
+                        continue
+                except Exception as e:
+                    logger.error(f"Frame decode error: {e}")
+                    await websocket.send_json({"type": "error", "error": f"Decode error: {str(e)}"})
+                    continue
 
-                await websocket.send_json(response)
+                # Process frame through M1-M5 pipeline
+                try:
+                    response = inference_engine.process_frame(frame)
+                    await websocket.send_json(response)
+                    frame_count += 1
+                    if frame_count % 30 == 0:
+                        logger.info(f"Processed {frame_count} frames")
+                except Exception as e:
+                    logger.error(f"Inference error on frame {frame_count}: {e}", exc_info=True)
+                    await websocket.send_json({"type": "error", "error": f"Inference error: {str(e)}"})
+                    continue
 
             except Exception as e:
-                logger.error(f"Frame processing error: {e}")
-                await websocket.send_json({"error": str(e)})
+                logger.error(f"WebSocket message handling error: {e}", exc_info=True)
+                try:
+                    await websocket.send_json({"type": "error", "error": str(e)})
+                except:
+                    break
 
     except Exception as e:
-        logger.error(f"WebSocket error: {e}")
+        logger.error(f"WebSocket error: {e}", exc_info=True)
 
     finally:
-        logger.info("WebSocket client disconnected")
+        logger.info(f"WebSocket client disconnected after {frame_count} frames")
 
 
 @app.post("/api/train-m2")
@@ -255,6 +309,78 @@ async def train_m2_endpoint(data_dir: str = "data/raw"):
         "data_dir": data_dir,
         "message": "Check backend logs for progress"
     }
+
+
+@app.post("/api/debug-frame")
+async def debug_frame(file: UploadFile = File(...)):
+    """
+    Debug endpoint: Returns frame quality metrics and MediaPipe detection status.
+
+    Useful for diagnosing why MediaPipe fails to detect hands on browser frames.
+    """
+    global inference_engine
+
+    try:
+        contents = await file.read()
+        nparr = np.frombuffer(contents, np.uint8)
+        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+        if frame is None:
+            return JSONResponse({"error": "Invalid image"}, status_code=400)
+
+        h, w = frame.shape[:2]
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        brightness = float(gray.mean())
+        contrast = float(gray.std())
+        file_size_kb = len(contents) / 1024
+
+        # Run MediaPipe detection
+        if inference_engine:
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+            timestamp_ms = int(time.time() * 1000)
+            hand_result = inference_engine.hand_landmarker.detect_for_video(mp_image, timestamp_ms)
+            pose_result = inference_engine.pose_landmarker.detect_for_video(mp_image, timestamp_ms)
+
+            has_hands = hand_result is not None and len(hand_result.hand_landmarks) > 0
+            num_hands = len(hand_result.hand_landmarks) if has_hands else 0
+            has_pose = pose_result is not None and len(pose_result.pose_landmarks) > 0
+
+            hand_scores = []
+            if has_hands:
+                for handedness in hand_result.handedness:
+                    hand_scores.append(float(handedness[0].score))
+
+            return {
+                "status": "ok",
+                "frame": {
+                    "width": w,
+                    "height": h,
+                    "file_size_kb": round(file_size_kb, 1),
+                    "brightness": round(brightness, 1),
+                    "contrast": round(contrast, 1),
+                },
+                "detection": {
+                    "has_hands": has_hands,
+                    "num_hands": num_hands,
+                    "hand_scores": hand_scores,
+                    "has_pose": has_pose,
+                }
+            }
+        else:
+            return {
+                "status": "inference_engine_not_ready",
+                "frame": {
+                    "width": w,
+                    "height": h,
+                    "file_size_kb": round(file_size_kb, 1),
+                    "brightness": round(brightness, 1),
+                    "contrast": round(contrast, 1),
+                },
+            }
+    except Exception as e:
+        logger.error(f"Debug frame error: {e}", exc_info=True)
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 @app.post("/api/collect-data")
