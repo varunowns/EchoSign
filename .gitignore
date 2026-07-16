@@ -61,3 +61,7 @@ models/*.pth
 *.mp4
 *.avi
 *.mov
+
+# Next.js build
+frontend/.next/
+frontend/out/

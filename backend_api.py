@@ -16,9 +16,8 @@ from fastapi.responses import JSONResponse
 import cv2
 import numpy as np
 import torch
-import asyncio
 import base64
-from typing import Optional
+from pathlib import Path
 import logging
 
 # Import M1-M5 pipeline components
@@ -54,18 +53,28 @@ app.add_middleware(
 inference_engine = None
 classifier_m2 = None
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+BASE_DIR = Path(__file__).resolve().parent
+
+
+def resolve_existing_path(*relative_paths: str) -> str:
+    """Resolve model paths across the repo root and backend/ directories."""
+    for rel_path in relative_paths:
+        candidate = (BASE_DIR / rel_path).resolve()
+        if candidate.exists():
+            return str(candidate)
+    return str((BASE_DIR / relative_paths[0]).resolve())
 
 
 class BackendConfig:
     """Configuration for backend inference."""
     def __init__(self):
-        self.use_m2 = True  # Static classifier
-        self.use_m4 = False  # LSTM (if trained)
+        self.use_m2 = False  # Static classifier
+        self.use_m4 = True  # LSTM - primary live model
         self.confidence_threshold = 0.7
         self.smoothing_window = 5
         self.debounce_frames = 3
-        self.model_path_m2 = "models/asl_alphabet.pkl"
-        self.model_path_m4 = "models/sequence_model.pt"
+        self.model_path_m2 = resolve_existing_path("backend/models/asl_alphabet.pkl", "models/asl_alphabet.pkl")
+        self.model_path_m4 = resolve_existing_path("backend/models/asl_sequence.pt", "models/asl_sequence.pt")
 
 
 config = BackendConfig()
@@ -80,10 +89,13 @@ async def startup_event():
 
     try:
         # Initialize live inference engine (M1-M5)
-        inference_engine = LiveInferenceEngine(model_path=None)
+        inference_engine = LiveInferenceEngine(model_path=config.model_path_m4)
+        config.use_m4 = inference_engine.model is not None
         logger.info("✓ M1-M5 pipeline initialized")
     except Exception as e:
         logger.warning(f"Could not initialize M1-M5 pipeline: {e}")
+        inference_engine = None
+        config.use_m4 = False
 
     try:
         # Load M2 classifier if available
@@ -97,15 +109,24 @@ async def startup_event():
     logger.info("Backend startup complete")
 
 
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Release backend resources on shutdown."""
+    global inference_engine
+    if inference_engine is not None:
+        inference_engine.close()
+        inference_engine = None
+
+
 @app.get("/api/health")
 async def health_check():
     """Health check endpoint."""
     return {
-        "status": "healthy",
+        "status": "healthy" if inference_engine is not None else "degraded",
         "m1_ready": inference_engine is not None,
         "m2_ready": classifier_m2 is not None and config.use_m2,
-        "m4_ready": config.use_m4,
-        "device": str(device)
+        "m4_ready": inference_engine is not None and inference_engine.model is not None and config.use_m4,
+        "device": str(device),
     }
 
 
@@ -207,33 +228,29 @@ async def websocket_live_inference(websocket: WebSocket):
                 continue
 
             try:
+                if inference_engine is None:
+                    await websocket.send_json(
+                        {"type": "error", "error": "Inference engine is not initialized."}
+                    )
+                    continue
+
                 # Decode base64 frame
+                if "," in data:
+                    data = data.split(",", 1)[1]
                 frame_data = base64.b64decode(data)
                 nparr = np.frombuffer(frame_data, np.uint8)
                 frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
                 if frame is None:
-                    await websocket.send_json({"error": "Invalid frame"})
+                    await websocket.send_json({"type": "error", "error": "Invalid frame"})
                     continue
 
-                # TODO: Extract keypoints from frame (M1)
-                # TODO: Run inference (M2 or M4)
-                # TODO: Post-process (M5)
-
-                # Placeholder response
-                response = {
-                    "type": "inference_result",
-                    "prediction": "A",
-                    "confidence": 0.92,
-                    "model": "m2",
-                    "timestamp": "2026-07-14T13:00:00Z"
-                }
-
+                response = inference_engine.process_frame(frame)
                 await websocket.send_json(response)
 
             except Exception as e:
                 logger.error(f"Frame processing error: {e}")
-                await websocket.send_json({"error": str(e)})
+                await websocket.send_json({"type": "error", "error": str(e)})
 
     except Exception as e:
         logger.error(f"WebSocket error: {e}")

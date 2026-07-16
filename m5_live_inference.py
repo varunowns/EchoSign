@@ -43,10 +43,26 @@ try:
 except:
     SequenceModel = None
 
+
+BASE_DIR = Path(__file__).resolve().parent
+
+
+def resolve_asset_path(asset_name: str) -> str:
+    """Resolve model assets whether the API runs from repo root or backend/."""
+    candidates = [
+        BASE_DIR / asset_name,
+        BASE_DIR / "backend" / asset_name,
+        BASE_DIR.parent / asset_name,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return str(BASE_DIR / asset_name)
+
 # Configuration
 CONFIG = {
-    "hand_model": "hand_landmarker.task",
-    "pose_model": "pose_landmarker.task",
+    "hand_model": resolve_asset_path("hand_landmarker.task"),
+    "pose_model": resolve_asset_path("pose_landmarker.task"),
     "sequence_length": 45,  # frames to buffer
     "confidence_threshold": 0.7,
     "smoothing_window": 5,  # frames for majority voting
@@ -138,6 +154,11 @@ class LiveInferenceEngine:
             smoothing_window=CONFIG["smoothing_window"],
             debounce_frames=CONFIG["debounce_frames"]
         )
+        self.start_time = time.time()
+        self.prev_time = 0.0
+        self.fps_history = deque(maxlen=10)
+        self.hand_landmarker = HandLandmarker.create_from_options(self.hand_options)
+        self.pose_landmarker = PoseLandmarker.create_from_options(self.pose_options)
 
     def load_model(self, model_path: str):
         """Load trained sequence model."""
@@ -145,10 +166,14 @@ class LiveInferenceEngine:
             print("PyTorch not available")
             return
 
-        self.model = SequenceModel(num_classes=26).to(self.device)
-        self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+        checkpoint = torch.load(model_path, map_location=self.device)
+        fc_weight = checkpoint.get('fc.weight')
+        num_classes = fc_weight.shape[0] if fc_weight is not None else 26
+
+        self.model = SequenceModel(num_classes=num_classes).to(self.device)
+        self.model.load_state_dict(checkpoint)
         self.model.eval()
-        print(f"✓ Model loaded from {model_path}")
+        print(f"[OK] Model loaded from {model_path} (num_classes={num_classes})")
 
     def predict_sequence(self) -> Tuple[Optional[str], float]:
         """Infer on buffered keypoint sequence."""
@@ -177,6 +202,81 @@ class LiveInferenceEngine:
 
         return None, 0.0
 
+    def _analyze_frame(self, frame, mirror_input: bool = False):
+        """Run the live pipeline on a single frame and return stabilized output."""
+        if mirror_input:
+            frame = cv2.flip(frame, 1)
+
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+        timestamp_ms = int((time.time() - self.start_time) * 1000)
+
+        hand_result = self.hand_landmarker.detect_for_video(mp_image, timestamp_ms)
+        pose_result = self.pose_landmarker.detect_for_video(mp_image, timestamp_ms)
+
+        kp = extract_keypoints(hand_result, pose_result)
+        kp_norm = normalize_keypoints(kp)
+        self.keypoint_buffer.append(kp_norm)
+
+        curr_time = time.time()
+        if self.prev_time > 0:
+            self.fps_history.append(1.0 / max(curr_time - self.prev_time, 1e-6))
+        self.prev_time = curr_time
+        avg_fps = float(np.mean(self.fps_history)) if self.fps_history else 0.0
+
+        committed = None
+        if len(self.keypoint_buffer) >= 10:
+            pred, conf = self.predict_sequence()
+            if pred and conf > CONFIG["confidence_threshold"]:
+                committed = self.post_processor.process(pred, conf)
+
+        return frame, hand_result, pose_result, committed, avg_fps
+
+    def process_frame(self, frame):
+        """Process a browser-supplied frame and return a WebSocket-friendly payload."""
+        if self.model is None:
+            return {
+                "type": "error",
+                "status": "model_unavailable",
+                "error": "Sequence model not loaded on backend.",
+            }
+
+        start = time.perf_counter()
+        _, _, _, committed, avg_fps = self._analyze_frame(frame, mirror_input=False)
+        latency_ms = int((time.perf_counter() - start) * 1000)
+
+        response = {
+            "type": "processing",
+            "status": "processing",
+            "prediction": None,
+            "confidence": None,
+            "latency_ms": latency_ms,
+            "fps": round(avg_fps, 2),
+            "buffer_fill": len(self.keypoint_buffer),
+        }
+
+        if committed:
+            prediction, confidence = committed
+            response.update(
+                {
+                    "type": "inference_result",
+                    "status": "success",
+                    "prediction": prediction,
+                    "confidence": float(round(confidence, 4)),
+                }
+            )
+
+        return response
+
+    def close(self):
+        """Release MediaPipe resources."""
+        if getattr(self, "hand_landmarker", None) is not None:
+            self.hand_landmarker.close()
+            self.hand_landmarker = None
+        if getattr(self, "pose_landmarker", None) is not None:
+            self.pose_landmarker.close()
+            self.pose_landmarker = None
+
     def run(self):
         """Main inference loop."""
         cap = cv2.VideoCapture(0)
@@ -203,73 +303,43 @@ class LiveInferenceEngine:
 
         paused = False
 
-        with HandLandmarker.create_from_options(self.hand_options) as hand_landmarker, \
-             PoseLandmarker.create_from_options(self.pose_options) as pose_landmarker:
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-            while cap.isOpened():
-                ret, frame = cap.read()
-                if not ret:
-                    break
+            if not paused:
+                frame, hand_result, pose_result, committed, avg_fps = self._analyze_frame(
+                    frame, mirror_input=True
+                )
+                self._draw_landmarks(frame, hand_result, pose_result)
 
+                if committed:
+                    word, avg_conf = committed
+                    transcript.append(word)
+                    print(f"[*] Recognized: {word} ({avg_conf:.2f})")
+            else:
+                avg_fps = 0
                 frame = cv2.flip(frame, 1)
-                h, w = frame.shape[:2]
 
-                if not paused:
-                    # Extract keypoints
-                    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-                    timestamp_ms = int((time.time() - start_time) * 1000)
+            self._draw_hud(frame, avg_fps, len(self.keypoint_buffer), transcript)
 
-                    hand_result = hand_landmarker.detect_for_video(mp_image, timestamp_ms)
-                    pose_result = pose_landmarker.detect_for_video(mp_image, timestamp_ms)
+            cv2.imshow("EchoSign M5 - Real-Time Inference (q=quit, SPACE=pause, c=clear)", frame)
 
-                    # Extract and normalize
-                    kp = extract_keypoints(hand_result, pose_result)
-                    kp_norm = normalize_keypoints(kp)
-                    self.keypoint_buffer.append(kp_norm)
-
-                    # Draw landmarks
-                    self._draw_landmarks(frame, hand_result, pose_result)
-
-                    # Predict
-                    if len(self.keypoint_buffer) >= 10:
-                        pred, conf = self.predict_sequence()
-                        if pred and conf > CONFIG["confidence_threshold"]:
-                            result = self.post_processor.process(pred, conf)
-                            if result:
-                                word, avg_conf = result
-                                transcript.append(word)
-                                print(f"🎯 Recognized: {word} ({avg_conf:.2f})")
-
-                    # FPS
-                    curr_time = time.time()
-                    if prev_time > 0:
-                        fps = 1.0 / (curr_time - prev_time)
-                        fps_history.append(fps)
-                    prev_time = curr_time
-                    avg_fps = np.mean(fps_history) if fps_history else 0
-
-                else:
-                    avg_fps = 0
-
-                # Draw HUD
-                self._draw_hud(frame, avg_fps, len(self.keypoint_buffer), transcript)
-
-                cv2.imshow("EchoSign M5 - Real-Time Inference (q=quit, SPACE=pause, c=clear)", frame)
-
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
-                    print("\n✓ Exiting...")
-                    break
-                elif key == ord(' '):
-                    paused = not paused
-                    print(f"\n>>> {'PAUSED' if paused else 'RESUMED'}")
-                elif key == ord('c'):
-                    transcript = []
-                    print("\n>>> Transcript cleared")
-
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                print("\n[OK] Exiting...")
+                break
+            elif key == ord(' '):
+                paused = not paused
+                print(f"\n>>> {'PAUSED' if paused else 'RESUMED'}")
+            elif key == ord('c'):
+                transcript = []
+                print("\n>>> Transcript cleared")
         cap.release()
         cv2.destroyAllWindows()
+        self.close()
+
 
         # Print final transcript
         print("\n" + "="*60)

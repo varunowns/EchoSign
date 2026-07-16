@@ -66,6 +66,7 @@ export default function EchoSignDashboard() {
 
   const { status, lastMessage, connect, disconnect, sendFrame, checkHealth } = useBackendInference();
 
+  const predictionStabilityRef = useRef<{pred: string, count: number, lastCommitted: string | null}>({pred: '', count: 0, lastCommitted: null});
   const entryIdRef = useRef(0);
   const debounceAnimRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const debounceResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -85,6 +86,26 @@ export default function EchoSignDashboard() {
     }
   }, []);
 
+  const commitLetter = useCallback(
+    (letter: string, conf: number) => {
+      // Commit to transcript immediately — do NOT wait for animation.
+      const entry: TranscriptEntry = {
+        id: ++entryIdRef.current,
+        text: GESTURE_SENTENCES[letter] || letter,
+        timestamp: getTimestamp(),
+        gesture: letter,
+      };
+      setTranscript((prev) => [...prev, entry]);
+
+      // Voice (fire once, not on every repeat)
+      if (isVoiceActive) {
+        setIsSpeaking(true);
+        setTimeout(() => setIsSpeaking(false), 2000);
+      }
+    },
+    [isVoiceActive]
+  );
+
   const triggerGestureTransition = useCallback(
     (newGesture: string, newConfidence: number) => {
       setGesture(newGesture);
@@ -94,6 +115,7 @@ export default function EchoSignDashboard() {
 
       clearGestureAnimation();
 
+      // Animate the debounce bar over 300 ms (purely visual).
       const startTime = Date.now();
       const duration = 300;
       debounceAnimRef.current = setInterval(() => {
@@ -102,19 +124,6 @@ export default function EchoSignDashboard() {
         setDebounceProgress(progress);
         if (progress >= 1) {
           clearGestureAnimation();
-          const entry: TranscriptEntry = {
-            id: ++entryIdRef.current,
-            text: GESTURE_SENTENCES[newGesture] || newGesture,
-            timestamp: getTimestamp(),
-            gesture: newGesture,
-          };
-          setTranscript((prev) => [...prev, entry]);
-
-          if (isVoiceActive) {
-            setIsSpeaking(true);
-            setTimeout(() => setIsSpeaking(false), 2000);
-          }
-
           debounceResetRef.current = setTimeout(() => {
             setIsPulsing(false);
             setDebounceProgress(0);
@@ -122,7 +131,7 @@ export default function EchoSignDashboard() {
         }
       }, 16);
     },
-    [clearGestureAnimation, isVoiceActive]
+    [clearGestureAnimation]
   );
 
   const stopCaptureLoop = useCallback(() => {
@@ -239,9 +248,37 @@ export default function EchoSignDashboard() {
     }
 
     if (lastMessage.prediction && typeof lastMessage.confidence === 'number') {
-      triggerGestureTransition(lastMessage.prediction, lastMessage.confidence);
+      const pred = lastMessage.prediction;
+      const conf = lastMessage.confidence;
+      const displayConfidence = conf <= 1 ? conf * 100 : conf;
+
+      // Stability check: only act when same prediction persists
+      // for 3+ frames (prevents flickering from oscillating model output).
+      // The backend PostProcessor already gates commits via cooldown, but we
+      // add a second layer here so the UI does not flicker mid-gesture.
+      const stab = predictionStabilityRef.current;
+      if (pred === stab.pred) {
+        stab.count++;
+      } else {
+        stab.pred = pred;
+        stab.count = 1;
+      }
+
+      if (stab.count >= 3) {
+        // Commit the letter to transcript immediately (the animation below
+        // is purely visual).  Only commit when it differs from the last
+        // committed prediction so we do not flood the transcript with
+        // repeated entries for the same held sign.
+        if (pred !== stab.lastCommitted) {
+          stab.lastCommitted = pred;
+          commitLetter(pred, displayConfidence);
+        }
+        // Start the pulsing / progress-bar animation on every 3-frame
+        // batch so the UI stays alive even for a held sign.
+        triggerGestureTransition(pred, displayConfidence);
+      }
     }
-  }, [isLiveMode, lastMessage, triggerGestureTransition]);
+  }, [isLiveMode, lastMessage, triggerGestureTransition, commitLetter]);
 
   const captureFrame = useCallback(() => {
     if (!isLiveMode || !cameraReady || !status.connected) return;

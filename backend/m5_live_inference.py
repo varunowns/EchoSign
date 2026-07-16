@@ -64,59 +64,58 @@ CONFIG = {
     "hand_model": resolve_asset_path("hand_landmarker.task"),
     "pose_model": resolve_asset_path("pose_landmarker.task"),
     "sequence_length": 45,
-    "confidence_threshold": 0.30,
-    "smoothing_window": 4,
-    "debounce_frames": 2,
+    "confidence_threshold": 0.15,  # lowered so M2 predictions flow to UI
+    "cooldown_frames": 30,  # re-commit same sign every ~1 second at 30 FPS
     "fps": 30,
 }
 
 
 class PostProcessor:
-    """Post-processing for predictions (smoothing, debounce, etc).
+    """
+    Lightweight temporal smoothing for predictions.
 
-    Tracks predictions over a sliding window and only commits when
-    the same prediction appears N+ times in a window of size K.
+    Uses a simple cooldown: once a prediction commits, subsequent identical
+    predictions are suppressed for 'cooldown_frames'. After cooldown expires,
+    the next frame prediction passes through immediately (no sliding window).
     """
 
-    def __init__(self, smoothing_window: int = 5, debounce_frames: int = 3):
-        self.smoothing_window = smoothing_window
-        self.debounce_frames = debounce_frames
-        self.prediction_history = deque(maxlen=smoothing_window)
-        self.confidence_history = deque(maxlen=smoothing_window)
+    def __init__(self, cooldown_frames: int = 30):
+        self.cooldown_frames = cooldown_frames
         self.last_committed = None
+        self.silence_counter = 0  # frames since last commit
 
     def reset(self):
-        """Clears all history. Call on WebSocket reconnect."""
-        self.prediction_history.clear()
-        self.confidence_history.clear()
+        """Clears all state. Call on WebSocket reconnect."""
         self.last_committed = None
+        self.silence_counter = 0
 
     def process(self, prediction: str, confidence: float) -> Optional[Tuple[str, float]]:
         """
-        Returns (word, confidence) or None if not stable yet.
-        Uses majority-vote smoothing + debounce.
+        Returns (prediction, confidence) after cooldown expires.
+
+        - First prediction always passes through.
+        - Same prediction is blocked until cooldown_frames have passed.
+        - Different prediction passes immediately (hand sign change detected).
         """
-        self.prediction_history.append(prediction)
-        self.confidence_history.append(confidence)
+        # Hand sign changed — commit immediately
+        if self.last_committed is not None and prediction != self.last_committed:
+            self.last_committed = prediction
+            self.silence_counter = 0
+            return prediction, confidence
 
-        if len(self.prediction_history) < self.smoothing_window:
-            return None  # not enough data yet
-
-        from collections import Counter
-        pred_counts = Counter(self.prediction_history)
-        smoothed_pred, count = pred_counts.most_common(1)[0]
-        smoothed_conf = float(np.mean(list(self.confidence_history)))
-
-        # Debounce: require N stable frames within the window
-        if count < self.debounce_frames:
+        # Same as last committed — debounce via cooldown
+        if prediction == self.last_committed:
+            self.silence_counter += 1
+            if self.silence_counter >= self.cooldown_frames:
+                # Cooldown expired — re-commit to show user it's still active
+                self.silence_counter = 0
+                return prediction, confidence
             return None
 
-        # Only commit if different from last committed
-        if self.last_committed == smoothed_pred:
-            return None
-
-        self.last_committed = smoothed_pred
-        return smoothed_pred, smoothed_conf
+        # First ever prediction
+        self.last_committed = prediction
+        self.silence_counter = 0
+        return prediction, confidence
 
 
 class LiveInferenceEngine:
@@ -156,10 +155,9 @@ class LiveInferenceEngine:
         self._mediapipe_timestamp = 0
         self._timestamp_step_ms = 33  # ~30 FPS
 
-        # M2 gets its OWN post-processor (separate from M4)
+        # M2 gets its OWN post-processor (cooldown-based debounce)
         self.m2_post_processor = PostProcessor(
-            smoothing_window=CONFIG["smoothing_window"],
-            debounce_frames=CONFIG["debounce_frames"]
+            cooldown_frames=CONFIG["cooldown_frames"]
         )
 
         # Initialize all mutable state
@@ -192,6 +190,27 @@ class LiveInferenceEngine:
         self.model.load_state_dict(checkpoint)
         self.model.eval()
         print(f"[OK] Model loaded from {model_path} (num_classes={num_classes})")
+
+    def predict_sequence(self) -> Tuple[Optional[str], float]:
+        """Infer on buffered keypoint sequence using M4 LSTM model."""
+        if not self.model or len(self.keypoint_buffer) < 10:
+            return None, 0.0
+
+        import numpy as np
+        seq = np.array(list(self.keypoint_buffer))
+        seq_len = len(seq)
+        if seq_len < CONFIG["sequence_length"]:
+            seq = np.pad(seq, ((0, CONFIG["sequence_length"] - seq_len), (0, 0)))
+        else:
+            seq = seq[:CONFIG["sequence_length"]]
+
+        with torch.no_grad():
+            x = torch.FloatTensor(seq).unsqueeze(0).to(self.device)
+            logits = self.model(x)
+            probs = torch.softmax(logits, dim=1)[0]
+            conf, pred_idx = probs.max(dim=0)
+            pred_char = chr(ord('A') + pred_idx.item())
+            return pred_char, conf.item()
 
     def _extract_keypoints(self, frame):
         """Run MediaPipe and return keypoints."""
@@ -246,7 +265,6 @@ class LiveInferenceEngine:
         """Process a frame and return a WebSocket-friendly payload.
 
         Primary classifier: M2 (frame-by-frame Random Forest, trained on real data).
-        Falls back to M4 (LSTM sequence) if M2 unavailable.
         """
         start = time.perf_counter()
 
@@ -279,25 +297,24 @@ class LiveInferenceEngine:
             "has_pose": pose_result is not None and len(pose_result.pose_landmarks) > 0,
         }
 
-        # Step 4: Run M2 classifier (PRIMARY — real ASL alphabet data)
+        # Step 4: Run M2 frame classifier — apply PostProcessor to gate commits
         if self.m2_classifier is not None and has_hands:
             m2_pred, m2_conf = self._predict_m2()
-            response["m2_prediction"] = m2_pred
-            response["m2_confidence"] = round(m2_conf, 4)
-
+            response["prediction"] = m2_pred
+            response["confidence"] = round(m2_conf, 4)
             if m2_pred and m2_conf >= CONFIG["confidence_threshold"]:
+                # Gate through PostProcessor so the frontend does not get a
+                # continuous firehose of "inference_result" every frame.
                 committed = self.m2_post_processor.process(m2_pred, m2_conf)
-                if committed:
-                    prediction, confidence = committed
-                    response.update({
-                        "type": "inference_result",
-                        "status": "success",
-                        "prediction": prediction,
-                        "confidence": float(round(confidence, 4)),
-                    })
+                if committed is not None:
+                    response["type"] = "inference_result"
+                    response["status"] = "success"
 
-        # Step 5: M4 fallback (currently disabled when M2 is active)
-        # (M4 sequence model was trained on synthetic data; M2 is more reliable)
+        # Also run M4 sequence model for reference
+        if self.model is not None and has_hands and len(self.keypoint_buffer) >= 30:
+            m4_pred, m4_conf = self.predict_sequence()
+            response["m4_prediction"] = m4_pred
+            response["m4_confidence"] = round(m4_conf, 4)
 
         return response
 

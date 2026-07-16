@@ -42,57 +42,121 @@ NUM_CLASSES = 26
 
 
 class FrameFeatureExtractor:
-    """Extract features from single keypoint frame."""
+    """Extract rich discriminative features from single keypoint frame.
+
+    Feature categories (82 total):
+      - Absolute positions (12): wrist, elbow, shoulder x/y
+      - Hand centroids (4): left/right hand center x/y
+      - Wrist-to-fingertip angles (20): 5 fingers x 2 hands x 2 (angle, length)
+      - Inter-finger distances (20): finger-to-finger spreads for each hand
+      - Finger curl ratios (10): distance from palm to fingertip vs palm to knuckle
+      - Hand shape context (8): pairwise fingertip distances within each hand
+      - Wrist-centroid vectors (4): vector from wrist to hand center for each hand
+      - Confidence scores (2): mean hand detection confidence
+      - Shoulder features (2): width, angle
+    """
 
     @staticmethod
     def extract(keypoint: np.ndarray) -> np.ndarray:
-        """Extract 40+ dimensional features from 300D keypoint vector."""
+        """Extract ~82 discriminative features from 300D keypoint vector."""
         pose = keypoint[:132].reshape(33, 4)
         left_hand = keypoint[132:216].reshape(21, 4)
         right_hand = keypoint[216:300].reshape(21, 4)
 
         features = []
 
-        # Hand centroids
-        left_centroid = left_hand[:, :2].mean(axis=0)
-        right_centroid = right_hand[:, :2].mean(axis=0)
-        features.extend(left_centroid)
-        features.extend(right_centroid)
-
-        # Hand distance
-        hand_distance = np.linalg.norm(right_centroid - left_centroid)
-        features.append(hand_distance)
-
-        # Wrist positions
+        # ---- Absolute body landmark positions (12) ----
         left_wrist = pose[15, :2]
         right_wrist = pose[16, :2]
-        features.extend(left_wrist)
-        features.extend(right_wrist)
-
-        # Confidence
-        left_conf = left_hand[:, 3].mean()
-        right_conf = right_hand[:, 3].mean()
-        features.extend([left_conf, right_conf])
-
-        # Finger spreads
-        left_root = left_hand[0, :2]
-        left_fingertips = [left_hand[i, :2] for i in [4, 8, 12, 16, 20]]
-        left_spreads = [np.linalg.norm(ft - left_root) for ft in left_fingertips]
-        features.extend(left_spreads)
-
-        right_root = right_hand[0, :2]
-        right_fingertips = [right_hand[i, :2] for i in [4, 8, 12, 16, 20]]
-        right_spreads = [np.linalg.norm(ft - right_root) for ft in right_fingertips]
-        features.extend(right_spreads)
-
-        # Shoulder angle
+        left_elbow = pose[13, :2]
+        right_elbow = pose[14, :2]
         left_shoulder = pose[11, :2]
         right_shoulder = pose[12, :2]
+        features.extend(left_wrist); features.extend(right_wrist)
+        features.extend(left_elbow); features.extend(right_elbow)
+        features.extend(left_shoulder); features.extend(right_shoulder)
+
+        # ---- Hand centroids (4) ----
+        left_centroid = left_hand[:, :2].mean(axis=0)
+        right_centroid = right_hand[:, :2].mean(axis=0)
+        features.extend(left_centroid); features.extend(right_centroid)
+
+        # ---- Wrist-to-centroid vectors (4) ----
+        features.extend(right_centroid - right_wrist)
+        features.extend(left_centroid - left_wrist)
+
+        # ---- Finger features for each hand ----
+        FINGER_TIPS = [4, 8, 12, 16, 20]  # thumb, index, middle, ring, pinky
+        FINGER_DIPS = [3, 7, 11, 15, 19]   # second joint
+        FINGER_MCPS = [2, 6, 10, 14, 18]   # knuckle (MCP)
+
+        for hand in [left_hand, right_hand]:
+            root = hand[0, :2]  # palm root (landmark 0)
+
+            # Finger lengths (10): distance from wrist to each fingertip
+            for tip_idx in FINGER_TIPS:
+                tip = hand[tip_idx, :2]
+                features.append(np.linalg.norm(tip - root))
+
+            # Finger curl ratios (10): distal-to-tip distance / MCP-to-tip distance
+            # Curled fingers have ratio near 1, extended fingers have ratio < 1
+            for tip_idx, mcp_idx in zip(FINGER_TIPS, FINGER_MCPS):
+                tip = hand[tip_idx, :2]
+                mcp = hand[mcp_idx, :2]
+                tip_to_root = np.linalg.norm(tip - root)
+                mcp_to_root = np.linalg.norm(mcp - root)
+                curl = tip_to_root / max(mcp_to_root, 1e-6)
+                features.append(curl)
+
+            # Inter-finger spreads (4): distance between adjacent fingertips
+            for i in range(len(FINGER_TIPS) - 1):
+                tip1 = hand[FINGER_TIPS[i], :2]
+                tip2 = hand[FINGER_TIPS[i+1], :2]
+                features.append(np.linalg.norm(tip1 - tip2))
+
+            # Finger-to-finger angles (6): angle between each finger pair
+            # This is key for distinguishing B (parallel) from C (curved)
+            for i in range(len(FINGER_TIPS)):
+                for j in range(i+1, len(FINGER_TIPS)):
+                    v1 = hand[FINGER_TIPS[i], :2] - root
+                    v2 = hand[FINGER_TIPS[j], :2] - root
+                    dot = np.dot(v1, v2)
+                    norms = np.linalg.norm(v1) * np.linalg.norm(v2)
+                    cos_angle = dot / max(norms, 1e-6)
+                    features.append(cos_angle)  # -1 to 1
+
+            # Distance from each fingertip to the centroid (shape context, 5)
+            for tip_idx in FINGER_TIPS:
+                features.append(np.linalg.norm(hand[tip_idx, :2] - right_centroid))
+
+            # Hand opening ratio: spread of furthest fingers vs palm size
+            pinky_tip = hand[20, :2]
+            thumb_tip = hand[4, :2]
+            max_spread = np.linalg.norm(pinky_tip - thumb_tip)
+            features.append(max_spread)
+
+            # Wrist-to-fingertip vector direction (2 per hand): mean direction
+            vectors = [hand[ti, :2] - root for ti in FINGER_TIPS]
+            mean_vec = np.mean(vectors, axis=0)
+            features.extend(mean_vec / max(np.linalg.norm(mean_vec), 1e-6))
+
+        # ---- Hand detection confidence (2) ----
+        features.append(left_hand[:, 3].mean())
+        features.append(right_hand[:, 3].mean())
+
+        # ---- Shoulder features (2) ----
+        shoulder_width = np.linalg.norm(right_shoulder - left_shoulder)
+        features.append(shoulder_width)
         shoulder_vector = right_shoulder - left_shoulder
-        shoulder_angle = np.arctan2(shoulder_vector[1], shoulder_vector[0])
-        features.append(shoulder_angle)
+        features.append(np.arctan2(shoulder_vector[1], shoulder_vector[0]))
 
         return np.array(features)
+
+    @staticmethod
+    def extract_batch(keypoints: np.ndarray) -> np.ndarray:
+        """Extract features from batch of frames."""
+        features_list = [FrameFeatureExtractor.extract(kp) for kp in keypoints]
+        return np.array(features_list)
 
     @staticmethod
     def extract_batch(keypoints: np.ndarray) -> np.ndarray:
